@@ -6,33 +6,32 @@ import requests
 import wmi
 import winreg
 from datetime import datetime
-from tabulate import tabulate
+import tkinter as tk
+from tkinter import ttk, messagebox
+from pandastable import Table
+import pandas as pd
 from colorama import Fore, init
 init(autoreset=True)
 
 # ========================= Настройки ===============================
-wmi_conn = wmi.WMI()
-VIRUSTOTAL_API_KEY = ''  # ← Вставьте свой ключ отсюда: https://www.virustotal.com/ 
+VIRUSTOTAL_API_KEY = ''
+SETTINGS_FILE = 'task_spy_settings.json'
 REPORT_FILE = 'task_spy_report_full.json'
+
+# ========================= Системные данные ===============================
+wmi_conn = wmi.WMI()
 
 TARGET_EXTENSIONS = ['.py', '.bat', '.ps1']
 SUSPICIOUS_NAMES = ['svshost', 'chrome_update', 'winlogin', 'serviceshost']
 SUSPICIOUS_LOCATIONS = ['\\appdata\\', '\\temp\\', '\\programdata\\']
 SUSPICIOUS_EXTENSIONS = ['.pif', '.scr', '.com', '.dat', '.cpl']
 
-# ========================= Функции обработки данных ===============================
-def truncate(s, max_len=50):
-    """Обрезка слишком длинных строк"""
-    s = str(s)
-    return s[:max_len] + '...' if len(s) > max_len else s
-
-def sanitize_row(row):
-    """Очистка строки от нежелательных символов (переводов строки и т.д.)"""
-    return [truncate(str(cell).replace('\n', ' ').replace('\r', '').strip()) for cell in row]
-
-def sanitize_rows(rows):
-    """Очистка всех строк"""
-    return [sanitize_row(row) for row in rows]
+# ========================= Проверка администраторских прав ===============================
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
 
 # ========================= Хэширование и VT ===============================
 def hash_file(path):
@@ -48,12 +47,12 @@ def hash_file(path):
     except Exception:
         return None
 
-def query_virustotal(file_hash):
-    if not file_hash or not VIRUSTOTAL_API_KEY:
+def query_virustotal(file_hash, api_key):
+    if not file_hash or not api_key:
         return '—'
     try:
         url = f'https://www.virustotal.com/api/v3/files/{file_hash}' 
-        headers = {'x-apikey': VIRUSTOTAL_API_KEY}
+        headers = {'x-apikey': api_key}
         resp = requests.get(url, headers=headers)
         if resp.status_code == 200:
             stats = resp.json()['data']['attributes']['last_analysis_stats']
@@ -81,14 +80,9 @@ def find_script_processes():
             continue
     return found
 
-def is_suspicious_path(path): 
-    return any(loc in (path or '').lower() for loc in SUSPICIOUS_LOCATIONS)
-
-def is_suspicious_name(name): 
-    return any(name.lower().startswith(sus) for sus in SUSPICIOUS_NAMES)
-
-def is_suspicious_ext(path): 
-    return any(path.lower().endswith(ext) for ext in SUSPICIOUS_EXTENSIONS)
+def is_suspicious_path(path): return any(loc in (path or '').lower() for loc in SUSPICIOUS_LOCATIONS)
+def is_suspicious_name(name): return any(name.lower().startswith(sus) for sus in SUSPICIOUS_NAMES)
+def is_suspicious_ext(path): return any(path.lower().endswith(ext) for ext in SUSPICIOUS_EXTENSIONS)
 
 def scan_suspicious_processes():
     results = []
@@ -108,20 +102,19 @@ def scan_suspicious_processes():
 
             if reasons:
                 results.append({
-                    'pid': info['pid'],
-                    'name': name,
-                    'exe': exe,
-                    'cmdline': cmdline,
-                    'username': info['username'],
-                    'ppid': info['ppid'],
-                    'started': datetime.fromtimestamp(info['create_time']).strftime('%Y-%m-%d %H:%M:%S'),
-                    'reasons': reasons
+                    'PID': info['pid'],
+                    'Имя': name,
+                    'Путь': exe,
+                    'Аргументы': cmdline,
+                    'Пользователь': info['username'],
+                    'Родительский PID': info['ppid'],
+                    'Старт': datetime.fromtimestamp(info['create_time']).strftime('%Y-%m-%d %H:%M:%S'),
+                    'Причины': ', '.join(reasons)
                 })
         except Exception:
             continue
     return results
 
-# ========================= Сбор автозагрузок ===============================
 def collect_autoruns_registry():
     entries = []
     keys = [
@@ -136,8 +129,9 @@ def collect_autoruns_registry():
                 try:
                     name, val, _ = winreg.EnumValue(reg_key, i)
                     entries.append({
-                        'source': f"{'HKCU' if root == winreg.HKEY_CURRENT_USER else 'HKLM'}\\{path}",
-                        'name': name, 'command': val
+                        'Источник': f"{'HKCU' if root == winreg.HKEY_CURRENT_USER else 'HKLM'}\\{path}",
+                        'Имя': name,
+                        'Команда': val
                     })
                 except OSError:
                     break
@@ -156,9 +150,9 @@ def collect_startup_folders():
             for file in os.listdir(folder):
                 full_path = os.path.join(folder, file)
                 entries.append({
-                    'folder': folder,
-                    'file': file,
-                    'full_path': full_path
+                    'Папка': folder,
+                    'Файл': file,
+                    'Полный путь': full_path
                 })
     return entries
 
@@ -183,9 +177,9 @@ def collect_scheduled_tasks_full():
 def collect_wmi_tasks():
     try:
         return [{
-            'Name': i.Name,
-            'Command': i.Command,
-            'User': i.User
+            'Имя': i.Name,
+            'Команда': i.Command,
+            'Пользователь': i.User
         } for i in wmi_conn.Win32_StartupCommand()]
     except Exception:
         return []
@@ -193,130 +187,171 @@ def collect_wmi_tasks():
 def collect_services():
     try:
         return [{
-            'Name': x.Name,
-            'DisplayName': x.DisplayName,
-            'PathName': x.PathName
-        } for x in wmi_conn.Win32_Service()
-        if x.StartMode == "Auto" and x.State == "Running"]
+            'Имя': x.Name,
+            'Отображаемое имя': x.DisplayName,
+            'Путь': x.PathName
+        } for x in wmi_conn.Win32_Service() if x.StartMode == "Auto" and x.State == "Running"]
     except Exception:
         return []
 
-# ========================= Вывод ===============================
-def print_table(title, rows, headers):
-    print(Fore.CYAN + f"\n=== {title} ({len(rows)}) ===")
-    if not rows:
-        print(Fore.GREEN + "✔ Ничего не найдено.")
-        return
-    
-    clean_headers = [truncate(h) for h in headers]
-    clean_rows = sanitize_rows([row for row in rows])
+# ========================= Интерфейс ===============================
+class TaskSpyGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("🔍 Task Spy ULTIMATE")
+        self.root.geometry("1400x800")
+        self.settings = self.load_settings()
 
-    print(tabulate(clean_rows, clean_headers, tablefmt='grid'))
+        # Меню
+        menubar = tk.Menu(self.root)
+        filemenu = tk.Menu(menubar, tearoff=0)
+        filemenu.add_command(label="Обновить всё", command=self.refresh_all)
+        filemenu.add_separator()
+        filemenu.add_command(label="Выход", command=self.root.quit)
+        menubar.add_cascade(label="Файл", menu=filemenu)
+        self.root.config(menu=menubar)
 
-def show_processes(processes):
-    if not processes:
-        print(Fore.GREEN + "\n✔ Подозрительных процессов нет.")
-        return
-    for i, p in enumerate(processes):
-        print(Fore.YELLOW + f"\n[{i}] PID={p['pid']} | {p['name']}")
-        print(f"   Пользователь: {p['username']}")
-        print(f"   Путь: {p['exe']}")
-        print(f"   Аргументы: {p['cmdline']}")
-        print(f"   Старт: {p['started']}")
-        print("   Причины:")
-        for r in p['reasons']:
-            print(f"    → {r}")
+        # Вкладки
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill='both', expand=True)
 
-# ========================= Интерактивный режим ===============================
-def interactive_suspicious_menu(processes):
-    if not processes:
-        print(Fore.GREEN + "\n✔ Нет подозрительных процессов.")
-        return
-    while True:
-        print(Fore.YELLOW + "\n👁 Интерактив: Выберите процесс")
-        for idx, p in enumerate(processes):
-            print(f"[{idx}] {p['name']} (PID {p['pid']})")
-        print("[q] Выход")
-        choice = input(">>> ").strip()
-        if choice.lower() == 'q':
-            break
-        if not choice.isdigit():
-            continue
-        idx = int(choice)
-        if idx < 0 or idx >= len(processes):
-            continue
-        p = processes[idx]
-        print(f"\nИмя: {p['name']}")
-        print(f"PID: {p['pid']}")
-        print(f"Файл: {p['exe']}")
-        print(f"Аргументы: {p['cmdline']}")
-        print(f"Запущен: {p['started']}")
-        print("Причины:")
-        for r in p['reasons']:
-            print(f" → {r}")
-        action = input("Действие [v=VT, k=kill, s=suspend, Enter=пропустить]: ").lower()
-        if action == 'v':
-            file_hash = hash_file(p['exe'])
-            result = query_virustotal(file_hash)
-            print(f"Результат VT: {result}")
-        elif action == 'k':
+        self.proc_frame = ttk.Frame(self.notebook)
+        self.auto_frame = ttk.Frame(self.notebook)
+        self.start_frame = ttk.Frame(self.notebook)
+        self.sched_frame = ttk.Frame(self.notebook)
+        self.wmi_frame = ttk.Frame(self.notebook)
+        self.serv_frame = ttk.Frame(self.notebook)
+        self.sett_frame = ttk.Frame(self.notebook)
+
+        self.notebook.add(self.proc_frame, text="Процессы")
+        self.notebook.add(self.auto_frame, text="Автозагрузка")
+        self.notebook.add(self.start_frame, text="Папки автозагрузки")
+        self.notebook.add(self.sched_frame, text="Задачи планировщика")
+        self.notebook.add(self.wmi_frame, text="WMI автозапуск")
+        self.notebook.add(self.serv_frame, text="Службы")
+        self.notebook.add(self.sett_frame, text="Настройки")
+
+        # Кнопка обновления
+        self.refresh_btn = ttk.Button(self.root, text="🔄 Обновить всё", command=self.refresh_all)
+        self.refresh_btn.pack(pady=5)
+
+        # Настройки
+        ttk.Label(self.sett_frame, text="VirusTotal API Key:").pack(anchor='w', padx=10, pady=5)
+        self.api_entry = ttk.Entry(self.sett_frame, width=60)
+        self.api_entry.pack(padx=10, pady=5)
+        self.save_api_btn = ttk.Button(self.sett_frame, text="💾 Сохранить", command=self.save_api_key)
+        self.save_api_btn.pack(padx=10, pady=5)
+
+        self.settings = self.load_settings()
+        self.api_entry.insert(0, self.settings.get('virustotal_api_key', ''))
+
+        # Таблицы
+        self.proc_table = self.create_table(self.proc_frame)
+        self.auto_table = self.create_table(self.auto_frame)
+        self.start_table = self.create_table(self.start_frame)
+        self.sched_table = self.create_table(self.sched_frame)
+        self.wmi_table = self.create_table(self.wmi_frame)
+        self.serv_table = self.create_table(self.serv_frame)
+
+        self.selected_proc = None
+        self.proc_listbox = tk.Listbox(self.root, height=5)
+        self.proc_listbox.pack(side='bottom', fill='x', padx=10, pady=5)
+        self.proc_listbox.bind('<<ListboxSelect>>', self.on_select_process)
+
+        self.refresh_all()
+
+    def create_table(self, parent):
+        frame = ttk.Frame(parent)
+        frame.pack(fill='both', expand=True)
+        pt = Table(frame, showtoolbar=False, showstatusbar=True)
+        pt.show()
+        return pt
+
+    def refresh_all(self):
+        self.selected_proc = None
+        self.proc_listbox.delete(0, tk.END)
+
+        # Обновление данных
+        processes = scan_suspicious_processes()
+        autoruns = collect_autoruns_registry()
+        startups = collect_startup_folders()
+        scheduled = collect_scheduled_tasks_full()
+        wmi_tasks = collect_wmi_tasks()
+        services = collect_services()
+
+        # Обновление таблиц
+        self.proc_table.model.df = pd.DataFrame(processes)
+        self.proc_table.redraw()
+
+        self.auto_table.model.df = pd.DataFrame(autoruns)
+        self.auto_table.redraw()
+
+        self.start_table.model.df = pd.DataFrame(startups)
+        self.start_table.redraw()
+
+        self.sched_table.model.df = pd.DataFrame(scheduled)
+        self.sched_table.redraw()
+
+        self.wmi_table.model.df = pd.DataFrame(wmi_tasks)
+        self.wmi_table.redraw()
+
+        self.serv_table.model.df = pd.DataFrame(services)
+        self.serv_table.redraw()
+
+        # Список для действий
+        for p in processes:
+            self.proc_listbox.insert(tk.END, f"[{p['PID']}] {p['Имя']} | {p['Причины']}")
+
+        # Сохранение отчета
+        json.dump({
+            'script_processes': find_script_processes(),
+            'suspicious_processes': processes,
+            'autoruns_registry': autoruns,
+            'startup_folders': startups,
+            'scheduled_tasks': scheduled,
+            'wmi': wmi_tasks,
+            'services': services
+        }, open(REPORT_FILE, 'w', encoding='utf-8'), indent=2, ensure_ascii=False)
+
+    def save_api_key(self):
+        key = self.api_entry.get().strip()
+        self.settings['virustotal_api_key'] = key
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.settings, f, indent=2, ensure_ascii=False)
+        messagebox.showinfo("✅", "API ключ сохранён")
+
+    def load_settings(self):
+        if os.path.exists(SETTINGS_FILE):
             try:
-                psutil.Process(p['pid']).terminate()
-                print("✔ Завершён.")
-            except Exception as e:
-                print(f"❌ Ошибка: {str(e)}")
-        elif action == 's':
-            try:
-                psutil.Process(p['pid']).suspend()
-                print("✔ Приостановлен.")
-            except Exception as e:
-                print(f"❌ Ошибка: {str(e)}")
+                with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def on_select_process(self, event):
+        idx = self.proc_listbox.curselection()
+        if not idx:
+            return
+        pid_str = self.proc_listbox.get(idx).split(']')[0][1:]
+        try:
+            pid = int(pid_str)
+            self.selected_proc = psutil.Process(pid)
+        except Exception:
+            self.selected_proc = None
+
+    def check_admin(self):
+        if not is_admin():
+            messagebox.showerror("Ошибка", "Программа должна быть запущена от имени администратора!")
+            self.root.destroy()
 
 # ========================== MAIN ==============================
-def main():
-    print(Fore.MAGENTA + "🔍 Task Spy ULTIMATE — Финальный скан системы\n")
-    
-    scripts = find_script_processes()
-    print_table("Запущенные скрипты", [
-        [p['pid'], p['name'], p['cmdline'], p['username'], p['ppid']] for p in scripts
-    ], ["PID", "Имя", "Команда", "Пользователь", "PPID"])
-    
-    suspicious = scan_suspicious_processes()
-    show_processes(suspicious)
-    
-    print_table("Реестр автозагрузки", [
-        [x['source'], x['name'], x['command']] for x in collect_autoruns_registry()
-    ], ["Источник", "Имя", "Команда"])
-    
-    print_table("Папки автозагрузки", [
-        [x['folder'], x['file'], x['full_path']] for x in collect_startup_folders()
-    ], ["Папка", "Файл", "Полный путь"])
-    
-    print_table("Планировщик (schtasks)", [
-        [t.get("TaskName", ""), t.get("Task To Run", ""), t.get("Status", ""), t.get("Last Run Time", "")]
-        for t in collect_scheduled_tasks_full()
-    ], ["Имя", "Команда", "Статус", "Последний запуск"])
-    
-    print_table("WMI автозапуск", [
-        [x['Name'], x['Command'], x['User']] for x in collect_wmi_tasks()
-    ], ["Имя", "Команда", "Пользователь"])
-    
-    print_table("Службы (автозапуск)", [
-        [x['Name'], x['DisplayName'], x['PathName']] for x in collect_services()
-    ], ["Имя", "Отображаемое", "Путь"])
-    
-    json.dump({
-        'script_processes': scripts,
-        'suspicious_processes': suspicious,
-        'autoruns_registry': collect_autoruns_registry(),
-        'startup_folders': collect_startup_folders(),
-        'scheduled_tasks': collect_scheduled_tasks_full(),
-        'wmi': collect_wmi_tasks(),
-        'services': collect_services()
-    }, open(REPORT_FILE, 'w', encoding='utf-8'), indent=2, ensure_ascii=False)
-    
-    print(Fore.CYAN + f"\n[✔] Отчёт сохранён: {REPORT_FILE}")
-    interactive_suspicious_menu(suspicious)
-
 if __name__ == '__main__':
-    main()
+    import ctypes
+    if not ctypes.windll.shell32.IsUserAnAdmin():
+        messagebox.showerror("Ошибка", "Запустите программу от имени администратора.")
+        exit()
+
+    root = tk.Tk()
+    app = TaskSpyGUI(root)
+    root.mainloop()
