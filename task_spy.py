@@ -18,20 +18,82 @@ VIRUSTOTAL_API_KEY = ''
 SETTINGS_FILE = 'task_spy_settings.json'
 REPORT_FILE = 'task_spy_report_full.json'
 
-# ========================= Системные данные ===============================
-wmi_conn = wmi.WMI()
+# ========================= Списки расширений ===============================
+TARGET_EXTENSIONS = [
+    '.py', '.bat', '.ps1', '.vbs', '.js', '.wsf', '.hta', '.lnk',
+    '.scf', '.url', '.reg', '.dll', '.sys', '.tmp', '.exe',
+    '.php', '.jsp', '.aspx', '.phtml', '.pl', '.cgi',
+    '.b64', '.enc', '.dat', '.bin', '.cache'
+]
 
-TARGET_EXTENSIONS = ['.py', '.bat', '.ps1']
 SUSPICIOUS_NAMES = ['svshost', 'chrome_update', 'winlogin', 'serviceshost']
 SUSPICIOUS_LOCATIONS = ['\\appdata\\', '\\temp\\', '\\programdata\\']
-SUSPICIOUS_EXTENSIONS = ['.pif', '.scr', '.com', '.dat', '.cpl']
+SUSPICIOUS_EXTENSIONS = [
+    '.pif', '.scr', '.com', '.cpl', '.msc', '.jar', '.msi', '.msp',
+    '.cab', '.psm1', '.psd1', '.nsh', '.vbe', '.jse', '.chm', '.hlp',
+    '.scpt', '.command', '.applescript', '.hta', '.sct', '.xml', '.xsl'
+]
 
-# ========================= Проверка администраторских прав ===============================
-def is_admin():
+# ========================= YARA ===============================
+try:
+    import yara
+    YARA_SUPPORTED = True
+except ImportError:
+    YARA_SUPPORTED = False
+
+YARA_RULES = """
+rule Suspicious_Powershell_Encoding {
+    meta:
+        description = "Зашифрованный PowerShell"
+    strings:
+        $enc1 = /powershell.*-enc.*/i
+        $enc2 = /cmd.* \\/c.*echo/i
+    condition:
+        $enc1 or $enc2
+}
+
+rule Malicious_Shellcode {
+    meta:
+        description = "Shellcode и syscall-инструкции"
+    strings:
+        $sysenter = { 0F 34 }
+        $syscall = { 0F 05 }
+        $jmp_rax = { FF E0 }
+        $call_rax = { FF D0 }
+    condition:
+        any of them
+}
+
+rule C2_Communication {
+    meta:
+        description = "C2-сервер"
+    strings:
+        $c2 = /GET \\/update|POST \\/login/i
+        $domain = /([a-zA-Z0-9-]+\\.)+[a-zA-Z]{2,6}/
+    condition:
+        $c2 and $domain
+}
+"""
+
+def compile_yara_rules():
+    if not YARA_SUPPORTED:
+        return None
     try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
+        return yara.compile(source=YARA_RULES)
+    except Exception as e:
+        print(Fore.RED + f"[!] Ошибка YARA: {str(e)}")
+        return None
+
+def scan_with_yara(file_path, rules):
+    if not YARA_SUPPORTED or not rules or not os.path.isfile(file_path):
+        return []
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        matches = rules.match(data=data)
+        return [match.rule for match in matches]
+    except Exception:
+        return []
 
 # ========================= Хэширование и VT ===============================
 def hash_file(path):
@@ -47,12 +109,12 @@ def hash_file(path):
     except Exception:
         return None
 
-def query_virustotal(file_hash, api_key):
-    if not file_hash or not api_key:
+def query_virustotal(file_hash):
+    if not file_hash or not VIRUSTOTAL_API_KEY:
         return '—'
     try:
         url = f'https://www.virustotal.com/api/v3/files/{file_hash}' 
-        headers = {'x-apikey': api_key}
+        headers = {'x-apikey': VIRUSTOTAL_API_KEY}
         resp = requests.get(url, headers=headers)
         if resp.status_code == 200:
             stats = resp.json()['data']['attributes']['last_analysis_stats']
@@ -84,7 +146,7 @@ def is_suspicious_path(path): return any(loc in (path or '').lower() for loc in 
 def is_suspicious_name(name): return any(name.lower().startswith(sus) for sus in SUSPICIOUS_NAMES)
 def is_suspicious_ext(path): return any(path.lower().endswith(ext) for ext in SUSPICIOUS_EXTENSIONS)
 
-def scan_suspicious_processes():
+def scan_suspicious_processes(yara_rules=None):
     results = []
     for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline', 'username', 'ppid', 'create_time']):
         try:
@@ -99,6 +161,12 @@ def scan_suspicious_processes():
             if is_suspicious_ext(exe): reasons.append("📦 Странное расширение")
             if info['ppid'] in (0, 4): reasons.append("🧬 Родитель PID = 0 / 4")
             if "powershell" in cmdline.lower() and "-enc" in cmdline.lower(): reasons.append("🔐 Зашифрованный PowerShell")
+
+            # YARA-сканирование
+            if yara_rules and exe and os.path.isfile(exe):
+                yara_matches = scan_with_yara(exe, yara_rules)
+                if yara_matches:
+                    reasons.extend([f"⚠ YARA: {rule}" for rule in yara_matches])
 
             if reasons:
                 results.append({
@@ -194,15 +262,28 @@ def collect_services():
     except Exception:
         return []
 
+# ========================= Функции для интерфейса ===============================
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {'virustotal_api_key': ''}
+
+def save_settings(settings):
+    with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(settings, f, indent=2, ensure_ascii=False)
+
 # ========================= Интерфейс ===============================
 class TaskSpyGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("🔍 Task Spy ULTIMATE")
+        self.root.title("🔍 Task Spy ULTIMATE — Анализ системы")
         self.root.geometry("1400x800")
-        self.settings = self.load_settings()
+        self.settings = load_settings()
 
-        # Меню
         menubar = tk.Menu(self.root)
         filemenu = tk.Menu(menubar, tearoff=0)
         filemenu.add_command(label="Обновить всё", command=self.refresh_all)
@@ -211,7 +292,6 @@ class TaskSpyGUI:
         menubar.add_cascade(label="Файл", menu=filemenu)
         self.root.config(menu=menubar)
 
-        # Вкладки
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill='both', expand=True)
 
@@ -228,10 +308,9 @@ class TaskSpyGUI:
         self.notebook.add(self.start_frame, text="Папки автозагрузки")
         self.notebook.add(self.sched_frame, text="Задачи планировщика")
         self.notebook.add(self.wmi_frame, text="WMI автозапуск")
-        self.notebook.add(self.serv_frame, text="Службы")
+        self.notebook.add(self.serv_frame, text="Службы Windows")
         self.notebook.add(self.sett_frame, text="Настройки")
 
-        # Кнопка обновления
         self.refresh_btn = ttk.Button(self.root, text="🔄 Обновить всё", command=self.refresh_all)
         self.refresh_btn.pack(pady=5)
 
@@ -241,8 +320,6 @@ class TaskSpyGUI:
         self.api_entry.pack(padx=10, pady=5)
         self.save_api_btn = ttk.Button(self.sett_frame, text="💾 Сохранить", command=self.save_api_key)
         self.save_api_btn.pack(padx=10, pady=5)
-
-        self.settings = self.load_settings()
         self.api_entry.insert(0, self.settings.get('virustotal_api_key', ''))
 
         # Таблицы
@@ -253,10 +330,13 @@ class TaskSpyGUI:
         self.wmi_table = self.create_table(self.wmi_frame)
         self.serv_table = self.create_table(self.serv_frame)
 
-        self.selected_proc = None
+        # Список действий над процессами
         self.proc_listbox = tk.Listbox(self.root, height=5)
         self.proc_listbox.pack(side='bottom', fill='x', padx=10, pady=5)
         self.proc_listbox.bind('<<ListboxSelect>>', self.on_select_process)
+
+        self.selected_proc = None
+        self.yara_rules = compile_yara_rules() if YARA_SUPPORTED else None
 
         self.refresh_all()
 
@@ -271,8 +351,7 @@ class TaskSpyGUI:
         self.selected_proc = None
         self.proc_listbox.delete(0, tk.END)
 
-        # Обновление данных
-        processes = scan_suspicious_processes()
+        processes = scan_suspicious_processes(self.yara_rules)
         autoruns = collect_autoruns_registry()
         startups = collect_startup_folders()
         scheduled = collect_scheduled_tasks_full()
@@ -298,11 +377,11 @@ class TaskSpyGUI:
         self.serv_table.model.df = pd.DataFrame(services)
         self.serv_table.redraw()
 
-        # Список для действий
+        # Список действий
         for p in processes:
             self.proc_listbox.insert(tk.END, f"[{p['PID']}] {p['Имя']} | {p['Причины']}")
 
-        # Сохранение отчета
+        # Отчёт
         json.dump({
             'script_processes': find_script_processes(),
             'suspicious_processes': processes,
@@ -316,18 +395,8 @@ class TaskSpyGUI:
     def save_api_key(self):
         key = self.api_entry.get().strip()
         self.settings['virustotal_api_key'] = key
-        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(self.settings, f, indent=2, ensure_ascii=False)
+        save_settings(self.settings)
         messagebox.showinfo("✅", "API ключ сохранён")
-
-    def load_settings(self):
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {}
 
     def on_select_process(self, event):
         idx = self.proc_listbox.curselection()
@@ -340,16 +409,11 @@ class TaskSpyGUI:
         except Exception:
             self.selected_proc = None
 
-    def check_admin(self):
-        if not is_admin():
-            messagebox.showerror("Ошибка", "Программа должна быть запущена от имени администратора!")
-            self.root.destroy()
-
 # ========================== MAIN ==============================
 if __name__ == '__main__':
     import ctypes
     if not ctypes.windll.shell32.IsUserAnAdmin():
-        messagebox.showerror("Ошибка", "Запустите программу от имени администратора.")
+        messagebox.showerror("Ошибка", "Программа должна быть запущена от имени администратора!")
         exit()
 
     root = tk.Tk()
