@@ -1,7 +1,5 @@
 import os
-import re
 import json
-import hashlib
 import subprocess
 import psutil
 import requests
@@ -14,8 +12,10 @@ from colorama import Fore, init
 init(autoreset=True)
 wmi_conn = wmi.WMI()
 
-VIRUSTOTAL_API_KEY = ''  # ← Опционально вставь свой API-ключ
-REPORT_FILE = 'task_spy_report_final.json'
+# === Настройки ===
+VIRUSTOTAL_API_KEY = ''  # ← Опционально вставьте ваш ключ
+REPORT_FILE = 'task_spy_report_full.json'
+
 TARGET_EXTENSIONS = ['.py', '.bat', '.ps1']
 SUSPICIOUS_NAMES = ['svshost', 'chrome_update', 'winlogin', 'serviceshost']
 SUSPICIOUS_LOCATIONS = ['\\appdata\\', '\\temp\\', '\\programdata\\']
@@ -24,6 +24,7 @@ SUSPICIOUS_EXTENSIONS = ['.pif', '.scr', '.com', '.dat', '.cpl']
 def hash_file(path):
     if not path or not os.path.isfile(path):
         return None
+    import hashlib
     h = hashlib.sha256()
     try:
         with open(path, 'rb') as f:
@@ -65,18 +66,7 @@ def find_script_processes():
             continue
     return found
 
-def find_scheduled_tasks():
-    tasks = []
-    try:
-        result = subprocess.run(['schtasks'], capture_output=True, text=True, shell=True)
-        for line in result.stdout.splitlines()[3:]:
-            if any(ext in line.lower() for ext in TARGET_EXTENSIONS):
-                tasks.append(line.strip())
-    except Exception:
-        pass
-    return tasks
-
-def is_suspicious_path(path): path = path.lower() if path else ''; return any(loc in path for loc in SUSPICIOUS_LOCATIONS)
+def is_suspicious_path(path): return any(loc in (path or '').lower() for loc in SUSPICIOUS_LOCATIONS)
 def is_suspicious_name(name): return any(name.lower().startswith(sus) for sus in SUSPICIOUS_NAMES)
 def is_suspicious_ext(path): return any(path.lower().endswith(ext) for ext in SUSPICIOUS_EXTENSIONS)
 
@@ -109,7 +99,7 @@ def scan_suspicious_processes():
             continue
     return results
 
-def collect_autoruns():
+def collect_autoruns_registry():
     entries = []
     keys = [
         (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run"),
@@ -132,14 +122,40 @@ def collect_autoruns():
             continue
     return entries
 
-def collect_services():
-    return [{
-        'name': svc.Name,
-        'display': svc.DisplayName,
-        'state': svc.State,
-        'path': svc.PathName
-    } for svc in wmi_conn.Win32_Service()
-        if svc.StartMode == 'Auto' and svc.State == 'Running' and is_suspicious_name(svc.Name or '')]
+def collect_startup_folders():
+    entries = []
+    folders = [
+        os.path.join(os.environ['APPDATA'], 'Microsoft\\Windows\\Start Menu\\Programs\\Startup'),
+        os.path.join(os.environ['PROGRAMDATA'], 'Microsoft\\Windows\\Start Menu\\Programs\\Startup')
+    ]
+    for folder in folders:
+        if os.path.exists(folder):
+            for file in os.listdir(folder):
+                full_path = os.path.join(folder, file)
+                entries.append({
+                    'folder': folder,
+                    'file': file,
+                    'full_path': full_path
+                })
+    return entries
+
+def collect_scheduled_tasks_full():
+    tasks = []
+    try:
+        result = subprocess.run(["schtasks", "/query", "/fo", "LIST", "/v"], capture_output=True, text=True, shell=True)
+        blocks = result.stdout.split("\n\n")
+        for b in blocks:
+            if "powershell" in b.lower() or any(ext in b.lower() for ext in TARGET_EXTENSIONS):
+                data = {}
+                for line in b.splitlines():
+                    if ':' in line:
+                        k, v = line.split(':', 1)
+                        data[k.strip()] = v.strip()
+                if data:
+                    tasks.append(data)
+    except Exception:
+        pass
+    return tasks
 
 def collect_wmi_tasks():
     try:
@@ -148,107 +164,81 @@ def collect_wmi_tasks():
             'Command': i.Command,
             'User': i.User
         } for i in wmi_conn.Win32_StartupCommand()]
-    except Exception: return []
+    except Exception:
+        return []
 
-def collect_drivers():
-    return [{
-        'Name': d.Name,
-        'Display': d.DisplayName,
-        'Path': d.PathName,
-        'Description': d.Description
-    } for d in wmi_conn.Win32_SystemDriver() if d.State == 'Running' and "Microsoft" not in (d.Description or "")]
+def collect_services():
+    try:
+        return [{
+            'Name': x.Name,
+            'DisplayName': x.DisplayName,
+            'PathName': x.PathName
+        } for x in wmi_conn.Win32_Service()
+            if x.StartMode == "Auto" and x.State == "Running" and x.Name not in ("WinDefend",)]
+    except Exception:
+        return []
 
 def print_table(title, rows, headers):
-    if not rows:
-        print(Fore.GREEN + f"\n✔ {title}: ничего не найдено.")
+    print(Fore.CYAN + f"\n=== {title} ({len(rows)}) ===")
+    if rows:
+        print(tabulate(rows, headers, tablefmt='fancy_grid'))
     else:
-        print(Fore.RED + f"\n📌 {title}:")
-        print(tabulate(rows, headers=headers, tablefmt='fancy_grid'))
+        print(Fore.GREEN + "✔ Ничего не найдено.")
 
-def show_processes_interactive(procs):
-    if not procs:
-        print(Fore.GREEN + "✔ Подозрительных процессов не найдено.\n")
+def show_processes(processes):
+    if not processes:
+        print(Fore.GREEN + "\n✔ Подозрительных процессов нет.")
         return
-    print(Fore.RED + f"\n🦠 Найдено подозрительных процессов: {len(procs)}\n")
-    while True:
-        for idx, p in enumerate(procs):
-            print(Fore.YELLOW + f"[{idx}] PID={p['pid']} | {p['name']}")
-            print(Fore.WHITE + f"    Путь: {p['exe']}")
-            print(f"    Аргументы: {p['cmdline']}")
-            print(f"    Пользователь: {p['username']}")
-            print(f"    Запущен: {p['started']}")
-            print("    Причины:")
-            for reason in p['reasons']:
-                print(f"      → {reason}")
-            print("-" * 60)
-        choice = input(Fore.CYAN + "\nВыбери [номер] процесса или 'q' для выхода: ").strip()
-        if choice.lower() == 'q':
-            break
-        if not choice.isdigit(): continue
-        index = int(choice)
-        if not (0 <= index < len(procs)): continue
-        selected = procs[index]
-        print(Fore.MAGENTA + f"\n▶ Выбран: PID {selected['pid']} | {selected['name']}")
-        action = input(
-            Fore.CYAN + "\nДействие:\n"
-                        "v — Проверка в VirusTotal\n"
-                        "k — Завершить процесс\n"
-                        "s — Приостановить\n"
-                        "[Enter] — ничего\n>>> ").lower().strip()
-        if action == 'v':
-            file_hash = hash_file(selected['exe'])
-            vt_res = query_virustotal(file_hash)
-            print(Fore.YELLOW + "Результат VirusTotal: " + vt_res)
-        elif action == 'k':
-            try: psutil.Process(selected["pid"]).terminate(); print(Fore.RED + "✔ Процесс завершён.")
-            except Exception as e: print(f"Ошибка: {e}")
-        elif action == 's':
-            try: psutil.Process(selected["pid"]).suspend(); print(Fore.MAGENTA + "✔ Процесс приостановлен.")
-            except Exception as e: print(f"Ошибка: {e}")
+    for i, p in enumerate(processes):
+        print(Fore.YELLOW + f"\n[{i}] PID={p['pid']} | {p['name']}")
+        print(f"   Пользователь: {p['username']}")
+        print(f"   Путь: {p['exe']}")
+        print(f"   Аргументы: {p['cmdline']}")
+        print(f"   Старт: {p['started']}")
+        print("   Причины:")
+        for r in p['reasons']:
+            print(f"    → {r}")
+        # Опционально: добавить проверку VirusTotal здесь
 
 def main():
-    print(Fore.CYAN + "👁‍🗨 Task Spy Pro — Финальная Версия\n")
-    script_procs = find_script_processes()
+    print(Fore.MAGENTA + "🔍 Task Spy ULTIMATE — Полный просмотр автозагрузок Windows 🔍\n")
+
+    scripts = find_script_processes()
     print_table("Запущенные скрипты", [
-        [p['pid'], p['name'], p['cmdline'], p['username'], p['ppid']] for p in script_procs
+        [p['pid'], p['name'], p['cmdline'], p['username'], p['ppid']] for p in scripts
     ], ["PID", "Имя", "Команда", "Пользователь", "PPID"])
 
-    scheduler_tasks = find_scheduled_tasks()
-    if scheduler_tasks:
-        print(Fore.YELLOW + "\n📋 Планировщик задач:")
-        for t in scheduler_tasks:
-            print(f"  • {t}")
-    else:
-        print(Fore.GREEN + "\n✔ Задач в планировщике не обнаружено.")
-
     suspicious = scan_suspicious_processes()
+    show_processes(suspicious)
 
-    print_table("Автозапуск", [
-        [a['source'], a['name'], a['command']] for a in collect_autoruns()
+    print_table("🧬 Реестр автозагрузки", [
+        [x['source'], x['name'], x['command']] for x in collect_autoruns_registry()
     ], ["Источник", "Имя", "Команда"])
 
-    print_table("Службы", [
-        [s['name'], s['display'], s['path']] for s in collect_services()
-    ], ["System Name", "Display", "Path"])
+    print_table("📂 Папки автозагрузки", [
+        [x['folder'], x['file'], x['full_path']] for x in collect_startup_folders()
+    ], ["Папка", "Файл", "Путь"])
 
-    print_table("WMI Запуск", [
-        [w['Name'], w['Command'], w['User']] for w in collect_wmi_tasks()
+    print_table("📋 Планировщик задач", [
+        [t.get("TaskName", ""), t.get("Task To Run", ""), t.get("Status", ""), t.get("Last Run Time", "")] for t in collect_scheduled_tasks_full()
+    ], ["Имя", "Команда", "Статус", "Последний запуск"])
+
+    print_table("🤖 WMI автозапуск", [
+        [x['Name'], x['Command'], x['User']] for x in collect_wmi_tasks()
     ], ["Имя", "Команда", "Пользователь"])
 
-    print_table("Драйверы", [
-        [d['Name'], d['Display'], d['Description'], d['Path']] for d in collect_drivers()
-    ], ["Имя", "Отображаемое", "Описание", "Путь"])
-
-    show_processes_interactive(suspicious)
+    print_table("⚙️ Службы (автозапуск)", [
+        [x['Name'], x['DisplayName'], x['PathName']] for x in collect_services()
+    ], ["Имя", "Отображаемое", "Путь"])
 
     json.dump({
-        'script_processes': script_procs,
-        'scheduler_tasks': scheduler_tasks,
+        'script_processes': scripts,
         'suspicious_processes': suspicious,
-        'autoruns': collect_autoruns(),
-        'services': collect_services(),
+        'autoruns_registry': collect_autoruns_registry(),
+        'startup_folders': collect_startup_folders(),
+        'scheduled_tasks': collect_scheduled_tasks_full(),
         'wmi': collect_wmi_tasks(),
-        'drivers': collect_drivers()
+        'services': collect_services()
     }, open(REPORT_FILE, 'w', encoding='utf-8'), indent=2, ensure_ascii=False)
 
     print(Fore.CYAN + f"\n[✔] Отчёт сохранён: {REPORT_FILE}")
