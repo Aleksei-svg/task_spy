@@ -6,7 +6,7 @@ from tabulate import tabulate
 from colorama import Fore, Style, init
 import json
 
-# Инициализация цвета
+# Цветной вывод
 init(autoreset=True)
 
 # Настройки
@@ -16,7 +16,8 @@ SUSPICIOUS_LOCATIONS = ['\\AppData\\', '\\Temp\\', '\\ProgramData\\']
 SUSPICIOUS_NAMES = ['svshost', 'chrome_update', 'winlogin', 'systemhost', 'updatehost', 'spoolsvc']
 SUSPICIOUS_EXTENSIONS = ['.pif', '.scr', '.com', '.cpl', '.dat']
 
-# 🔍 Поиск запущенных скриптовых процессов
+# ---------- ФУНКЦИИ ----------
+
 def find_suspects():
     suspects = []
     for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline', 'username', 'ppid']):
@@ -37,7 +38,6 @@ def find_suspects():
             continue
     return suspects
 
-# 📆 Поиск задач планировщика
 def get_scheduler_tasks():
     result = subprocess.run(["schtasks"], capture_output=True, text=True, shell=True)
     lines = result.stdout.splitlines()[3:]
@@ -47,7 +47,6 @@ def get_scheduler_tasks():
             scripts.append(line.strip())
     return scripts
 
-# 🖥 Красивый вывод процессов
 def print_suspects(suspects):
     if not suspects:
         print(Fore.GREEN + "Нет запущенных подозрительных скриптов.")
@@ -61,7 +60,6 @@ def print_suspects(suspects):
     print(Fore.YELLOW + "[ОТКРЫТЫЕ ПРОЦЕССЫ]\n")
     print(tabulate(table, headers=headers, tablefmt='fancy_grid'))
 
-# 💾 Сохранение отчета
 def save_report(suspects, scheduled, malware=None):
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     report = {
@@ -74,7 +72,6 @@ def save_report(suspects, scheduled, malware=None):
         json.dump(report, f, indent=4, ensure_ascii=False)
     print(Fore.CYAN + f"\n[✔] Отчет сохранён в {REPORT_FILE}")
 
-# 🔪 Завершить процесс
 def kill_process(pid):
     try:
         proc = psutil.Process(pid)
@@ -84,7 +81,6 @@ def kill_process(pid):
     except Exception as e:
         print(Fore.RED + f"Ошибка при завершении: {e}")
 
-# ⛔ Приостановить процесс
 def suspend_process(pid):
     try:
         proc = psutil.Process(pid)
@@ -93,7 +89,6 @@ def suspend_process(pid):
     except Exception as e:
         print(Fore.RED + f"Ошибка при остановке: {e}")
 
-# 📋 Меню для управления своими процессами
 def interact_menu(suspects):
     if not suspects:
         return
@@ -117,7 +112,8 @@ def interact_menu(suspects):
     except Exception as e:
         print(Fore.RED + f"Ошибка ввода: {e}")
 
-# 🦠 Поиск возможного malware
+# -------- НАШ АНТИВИРУСНЫЙ РЕЖИМ --------
+
 def is_suspicious_path(path):
     if not path:
         return False
@@ -125,74 +121,99 @@ def is_suspicious_path(path):
     return any(sub in path_lower for sub in SUSPICIOUS_LOCATIONS)
 
 def is_suspicious_name(name):
-    name = name.lower()
+    name = (name or '').lower()
     return any(fake in name for fake in SUSPICIOUS_NAMES)
 
 def is_suspicious_ext(path):
     return any(path.lower().endswith(ext) for ext in SUSPICIOUS_EXTENSIONS)
 
+def get_process_name(pid):
+    try:
+        return psutil.Process(pid).name()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return "N/A"
+
 def find_malware_candidates():
     suspects = []
-    for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline', 'username', 'ppid']):
+    for proc in psutil.process_iter(attrs=['pid', 'name', 'exe', 'cmdline', 'username', 'ppid', 'create_time']):
         reasons = []
         try:
             name = proc.info['name'] or ''
             exe = proc.info['exe'] or ''
+            cmdline = ' '.join(proc.info['cmdline']) if proc.info['cmdline'] else ''
             ppid = proc.info['ppid']
-            
+            username = proc.info['username']
+
             if is_suspicious_path(exe):
-                reasons.append("Запущен из подозрительного пути")
+                reasons.append("📁 Подозрительное расположение")
             if is_suspicious_name(name):
-                reasons.append("Имя похоже на поддельное системное")
+                reasons.append("🕵️ Похоже на фальшивое имя системы")
             if is_suspicious_ext(exe):
-                reasons.append("Подозрительное расширение")
+                reasons.append("📦 Необычное расширение")
             if ppid in (0, 4):
-                reasons.append("Необычный родительский PID")
-            
+                reasons.append("🧬 Родитель PID подозрительный")
+
             if reasons:
                 suspects.append({
                     'pid': proc.info['pid'],
                     'name': name,
                     'exe': exe,
-                    'username': proc.info['username'],
+                    'cmdline': cmdline,
+                    'username': username,
                     'ppid': ppid,
+                    'ppname': get_process_name(ppid),
+                    'start_time': datetime.fromtimestamp(proc.info['create_time']).strftime("%Y-%m-%d %H:%M:%S") if proc.info.get('create_time') else 'n/a',
                     'reasons': reasons
                 })
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
 
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+            continue
     return suspects
 
-# 🧾 Вывод опасных процессов
 def print_malware_section(candidates):
-    print("\n" + Fore.RED + "═" * 48)
-    print(Fore.RED + "     ПОДОЗРИТЕЛЬНЫЕ ПРОЦЕССЫ (malware-режим)    ")
-    print("═" * 48)
+    print("\n" + Fore.RED + "═" * 70)
+    print(Fore.RED + "        ПОДОЗРИТЕЛЬНЫЕ ПРОЦЕССЫ (malware-режим)")
+    print("═" * 70)
 
     if not candidates:
         print(Fore.GREEN + "Ни одного подозрительного процесса не найдено.")
         return
 
-    for i, proc in enumerate(candidates):
-        print(Fore.LIGHTRED_EX + f"\n[{i}] PID={proc['pid']} | Name={proc['name']}")
-        print(Fore.WHITE + f"     Путь: {proc['exe']}")
-        print(f"     Родитель: {proc['ppid']} | Пользователь: {proc['username']}")
-        for r in proc['reasons']:
-            print(Fore.YELLOW + f"     → {r}")
+    headers = ["#", "PID", "Имя", "Путь", "Род. PID", "Род. Имя", "Пользователь", "Время", "Причины"]
+    table = []
+    for idx, proc in enumerate(candidates):
+        reasons_summary = "\n".join(proc['reasons'])
+        table.append([
+            idx,
+            proc['pid'],
+            proc['name'] or "—",
+            proc['exe'] or "—",
+            proc['ppid'],
+            proc['ppname'],
+            proc['username'] or "—",
+            proc['start_time'],
+            reasons_summary
+        ])
+
+    print(tabulate(table, headers=headers, tablefmt='fancy_grid'))
 
     interact_malware_menu(candidates)
 
-# ☣️ Меню управления подозрительными процессами
 def interact_malware_menu(candidates):
     try:
         index = input(Fore.CYAN + "\nВыбери # процесса для действий (или q): ")
-        if index.lower() == "q":
+        if index.lower() == "q" or not index:
             return
         idx = int(index)
         target = candidates[idx]
-        print(Fore.MAGENTA + f"Процесс {target['pid']} выбран ({target['name']})")
-        
-        action = input("1 - Завершить, 2 - Приостановить, Enter - ничего: ").strip()
+        print(Fore.MAGENTA + f"\n▶ Процесс выбран:  PID={target['pid']} ({target['name']})")
+        print(Fore.LIGHTBLACK_EX + f"Путь: {target['exe']}")
+        print(Fore.LIGHTBLACK_EX + f"Command Line: {target['cmdline']}")
+        print(Fore.LIGHTBLACK_EX + f"Пользователь: {target['username']}")
+        print(Fore.LIGHTBLACK_EX + f"Время запуска: {target['start_time']}")
+        print(Fore.LIGHTBLACK_EX + f"Причины:\n - " + '\n - '.join(target['reasons']))
+
+        action = input(Fore.CYAN + "\n1 - Завершить, 2 - Приостановить, Enter - ничего: ").strip()
         if action == '1':
             kill_process(target['pid'])
         elif action == '2':
@@ -201,7 +222,8 @@ def interact_malware_menu(candidates):
     except Exception as e:
         print(Fore.RED + f"Ошибка: {e}")
 
-# 🚀 Основной запуск
+# -------- MAIN --------
+
 def main():
     print(Fore.CYAN + "👁‍🗨 Task Spy: Монитор задач и поиск подозрительных процессов\n")
 
@@ -219,7 +241,6 @@ def main():
 
     malware_candidates = find_malware_candidates()
     print_malware_section(malware_candidates)
-
     save_report(suspects, scheduled, malware_candidates)
     interact_menu(suspects)
 
