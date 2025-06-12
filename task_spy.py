@@ -12,14 +12,15 @@ from colorama import Fore, init
 init(autoreset=True)
 wmi_conn = wmi.WMI()
 
-# === Настройки ===
-VIRUSTOTAL_API_KEY = ''  # ← Опционально вставьте ваш ключ
+VIRUSTOTAL_API_KEY = ''  # ← Вставь свой ключ отсюда: https://www.virustotal.com/
 REPORT_FILE = 'task_spy_report_full.json'
 
 TARGET_EXTENSIONS = ['.py', '.bat', '.ps1']
 SUSPICIOUS_NAMES = ['svshost', 'chrome_update', 'winlogin', 'serviceshost']
 SUSPICIOUS_LOCATIONS = ['\\appdata\\', '\\temp\\', '\\programdata\\']
 SUSPICIOUS_EXTENSIONS = ['.pif', '.scr', '.com', '.dat', '.cpl']
+
+# ========================= Общие функции ===============================
 
 def hash_file(path):
     if not path or not os.path.isfile(path):
@@ -42,12 +43,14 @@ def query_virustotal(file_hash):
         headers = {'x-apikey': VIRUSTOTAL_API_KEY}
         resp = requests.get(url, headers=headers)
         if resp.status_code == 200:
-            data = resp.json()
-            stats = data['data']['attributes']['last_analysis_stats']
-            return f"{stats['malicious']}/{sum(stats.values())} VT"
-        return f"Ошибка {resp.status_code}"
+            stats = resp.json()['data']['attributes']['last_analysis_stats']
+            return f"{stats['malicious']}/{sum(stats.values())} детектов"
+        else:
+            return f"VT ошибка: {resp.status_code}"
     except Exception as e:
-        return f"Ошибка VT: {e}"
+        return f"VT ошибка: {str(e)}"
+
+# ========================= Сканеры ===============================
 
 def find_script_processes():
     found = []
@@ -80,10 +83,10 @@ def scan_suspicious_processes():
             cmdline = ' '.join(info['cmdline']) if info['cmdline'] else ''
             reasons = []
             if is_suspicious_path(exe): reasons.append("📁 Путь из Temp/AppData")
-            if is_suspicious_name(name): reasons.append("🕵 Подозрительное имя")
-            if is_suspicious_ext(exe): reasons.append("📦 Подозрительное расширение")
-            if info['ppid'] in (0, 4): reasons.append("🧬 Родитель PID 0/4")
-            if "powershell" in cmdline.lower() and "-enc" in cmdline.lower(): reasons.append("🔐 Использует шифрование")
+            if is_suspicious_name(name): reasons.append("🕵 Имя как у системного процесса")
+            if is_suspicious_ext(exe): reasons.append("📦 Странное расширение")
+            if info['ppid'] in (0, 4): reasons.append("🧬 Родитель PID = 0 / 4")
+            if "powershell" in cmdline.lower() and "-enc" in cmdline.lower(): reasons.append("🔐 Зашифрованный PowerShell")
             if reasons:
                 results.append({
                     'pid': info['pid'],
@@ -174,9 +177,11 @@ def collect_services():
             'DisplayName': x.DisplayName,
             'PathName': x.PathName
         } for x in wmi_conn.Win32_Service()
-            if x.StartMode == "Auto" and x.State == "Running" and x.Name not in ("WinDefend",)]
+        if x.StartMode == "Auto" and x.State == "Running"]
     except Exception:
         return []
+
+# ========================= Вывод ===============================
 
 def print_table(title, rows, headers):
     print(Fore.CYAN + f"\n=== {title} ({len(rows)}) ===")
@@ -198,10 +203,55 @@ def show_processes(processes):
         print("   Причины:")
         for r in p['reasons']:
             print(f"    → {r}")
-        # Опционально: добавить проверку VirusTotal здесь
+
+def interactive_suspicious_menu(processes):
+    if not processes:
+        print(Fore.GREEN + "\n✔ Нет подозрительных процессов.")
+        return
+    while True:
+        print(Fore.YELLOW + "\n👁 Интерактив: Выберите процесс")
+        for idx, p in enumerate(processes):
+            print(f"[{idx}] {p['name']} (PID {p['pid']})")
+        print("[q] Выход")
+        choice = input(">>> ").strip()
+        if choice.lower() == 'q':
+            break
+        if not choice.isdigit():
+            continue
+        idx = int(choice)
+        if idx < 0 or idx >= len(processes):
+            continue
+        p = processes[idx]
+        print(f"\nИмя: {p['name']}")
+        print(f"PID: {p['pid']}")
+        print(f"Файл: {p['exe']}")
+        print(f"Аргументы: {p['cmdline']}")
+        print(f"Запущен: {p['started']}")
+        print("Причины:")
+        for r in p['reasons']:
+            print(f" → {r}")
+        action = input("Действие [v=VT, k=kill, s=suspend, Enter=пропустить]: ").lower()
+        if action == 'v':
+            file_hash = hash_file(p['exe'])
+            result = query_virustotal(file_hash)
+            print(f"Результат VT: {result}")
+        elif action == 'k':
+            try:
+                psutil.Process(p['pid']).terminate()
+                print("✔ Завершён.")
+            except Exception as e:
+                print(f"❌ Ошибка: {str(e)}")
+        elif action == 's':
+            try:
+                psutil.Process(p['pid']).suspend()
+                print("✔ Приостановлен.")
+            except Exception as e:
+                print(f"❌ Ошибка: {str(e)}")
+
+# ========================== MAIN ==============================
 
 def main():
-    print(Fore.MAGENTA + "🔍 Task Spy ULTIMATE — Полный просмотр автозагрузок Windows 🔍\n")
+    print(Fore.MAGENTA + "🔍 Task Spy ULTIMATE — Финальный скан системы\n")
 
     scripts = find_script_processes()
     print_table("Запущенные скрипты", [
@@ -211,23 +261,24 @@ def main():
     suspicious = scan_suspicious_processes()
     show_processes(suspicious)
 
-    print_table("🧬 Реестр автозагрузки", [
+    print_table("Реестр автозагрузки", [
         [x['source'], x['name'], x['command']] for x in collect_autoruns_registry()
     ], ["Источник", "Имя", "Команда"])
 
-    print_table("📂 Папки автозагрузки", [
+    print_table("Папки автозагрузки", [
         [x['folder'], x['file'], x['full_path']] for x in collect_startup_folders()
-    ], ["Папка", "Файл", "Путь"])
+    ], ["Папка", "Файл", "Полный путь"])
 
-    print_table("📋 Планировщик задач", [
-        [t.get("TaskName", ""), t.get("Task To Run", ""), t.get("Status", ""), t.get("Last Run Time", "")] for t in collect_scheduled_tasks_full()
+    print_table("Планировщик (schtasks)", [
+        [t.get("TaskName", ""), t.get("Task To Run", ""), t.get("Status", ""), t.get("Last Run Time", "")]
+        for t in collect_scheduled_tasks_full()
     ], ["Имя", "Команда", "Статус", "Последний запуск"])
 
-    print_table("🤖 WMI автозапуск", [
+    print_table("WMI автозапуск", [
         [x['Name'], x['Command'], x['User']] for x in collect_wmi_tasks()
     ], ["Имя", "Команда", "Пользователь"])
 
-    print_table("⚙️ Службы (автозапуск)", [
+    print_table("Службы (автозапуск)", [
         [x['Name'], x['DisplayName'], x['PathName']] for x in collect_services()
     ], ["Имя", "Отображаемое", "Путь"])
 
@@ -242,6 +293,8 @@ def main():
     }, open(REPORT_FILE, 'w', encoding='utf-8'), indent=2, ensure_ascii=False)
 
     print(Fore.CYAN + f"\n[✔] Отчёт сохранён: {REPORT_FILE}")
+
+    interactive_suspicious_menu(suspicious)
 
 if __name__ == '__main__':
     main()
