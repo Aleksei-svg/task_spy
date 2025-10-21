@@ -11,10 +11,11 @@ from tkinter import ttk, messagebox
 from pandastable import Table
 import pandas as pd
 from colorama import Fore, init
+import threading
+import queue
 
 try:
     import win32api
-    from win32api import HIWORD, LOWORD
     PYWIN32_AVAILABLE = True
 except ImportError:
     PYWIN32_AVAILABLE = False
@@ -55,7 +56,6 @@ rule Suspicious_Powershell_Encoding {
     condition:
         $enc1 or $enc2
 }
-
 rule Malicious_Shellcode {
     meta:
         description = "Shellcode и syscall-инструкции"
@@ -67,50 +67,55 @@ rule Malicious_Shellcode {
     condition:
         any of them
 }
-
 rule C2_Communication {
     meta:
-        description = "C2-сервер"
+        description = "Подозрительные HTTP-запросы, характерные для C2"
     strings:
-        $c2 = /GET \\/update|POST \\/login/i
-        $domain = /([a-zA-Z0-9-]+\\.)+[a-zA-Z]{2,6}/
+        $c2_get = /GET \/update\.php\?id=/ nocase
+        $c2_post = /POST \/gate\.php/ nocase
+        $c2_useragent = "User-Agent: Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; Trident/5.0)"
     condition:
-        $c2 and $domain
+        1 of ($c2_*) or $c2_useragent
 }
-
 rule InMemory_PE_Header {
     meta:
-        description = "Обнаружен заголовок исполняемого файла (MZ) в памяти, что может указывать на Reflective DLL Injection."
+        description = "Обнаружен заголовок PE-файла (MZ) в памяти, что может указывать на Reflective DLL Injection."
     strings:
-        $mz = "MZ" at 0
+        $mz = "MZ"
         $pe = "PE"
     condition:
-        $mz and $pe
+        $mz at 0 and $pe
 }
 """
 
 def compile_yara_rules():
-    if not YARA_SUPPORTED: return None
+    if not YARA_SUPPORTED:
+        return None
     try:
         return yara.compile(source=YARA_RULES)
     except Exception as e:
-        print(Fore.RED + f"[!] Ошибка YARA: {str(e)}"); return None
+        print(Fore.RED + f"[!] Ошибка YARA: {str(e)}")
+        return None
 
 def scan_with_yara_file(file_path, rules):
-    if not YARA_SUPPORTED or not rules or not os.path.isfile(file_path): return []
+    if not YARA_SUPPORTED or not rules or not os.path.isfile(file_path):
+        return []
     try:
         matches = rules.match(filepath=file_path)
         return [match.rule for match in matches]
-    except Exception: return []
+    except Exception:
+        return []
 
 def scan_with_yara_memory(pid, rules):
-    if not YARA_SUPPORTED or not rules: return []
+    if not YARA_SUPPORTED or not rules:
+        return []
     try:
         matches = rules.match(pid=pid)
         return [match.rule for match in matches]
     except yara.Error:
         return []
-    except Exception: return []
+    except Exception:
+        return []
 
 # ========================= Внешние API ===============================
 def check_ip_abuseipdb(ip):
@@ -160,7 +165,8 @@ def scan_suspicious_processes(yara_rules=None):
         'explorer.exe': ['userinit.exe'],
         'lsass.exe': ['wininit.exe'],
     }
-    for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline', 'username', 'ppid', 'create_time', 'parent']):
+    attrs = ['pid', 'name', 'exe', 'cmdline', 'username', 'ppid', 'create_time']
+    for proc in psutil.process_iter(attrs):
         try:
             info = proc.info
             exe_path = info.get('exe')
@@ -182,7 +188,14 @@ def scan_suspicious_processes(yara_rules=None):
                 suspicion_score += 40
                 reasons.append(f"🕵 Имя '{name}' вне System32")
             
-            parent_name = (info.get('parent') and info['parent'].name()) or ''
+            parent_name = ''
+            try:
+                parent_proc = proc.parent()
+                if parent_proc:
+                    parent_name = parent_proc.name()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
             if name.lower() in legitimate_parents and parent_name.lower() not in legitimate_parents[name.lower()]:
                  suspicion_score += 30
                  reasons.append(f"🧬 Нетипичный родитель: {parent_name}")
@@ -234,8 +247,10 @@ def collect_autoruns_registry():
                 try:
                     name, val, _ = winreg.EnumValue(reg_key, i)
                     entries.append({'Источник': f"{'HKCU' if root == winreg.HKEY_CURRENT_USER else 'HKLM'}\\{path}", 'Имя': name, 'Команда': val})
-                except OSError: break
-        except FileNotFoundError: continue
+                except OSError:
+                    break
+        except FileNotFoundError:
+            continue
     return entries
 
 def collect_ifeo_hijacks():
@@ -252,11 +267,14 @@ def collect_ifeo_hijacks():
                     debugger_val, _ = winreg.QueryValueEx(sub_key, "Debugger")
                     if debugger_val:
                         entries.append({'Перехватываемый процесс': exe_name, 'Запускаемая программа (Debugger)': debugger_val})
-                except FileNotFoundError: pass
+                except FileNotFoundError:
+                    pass
                 winreg.CloseKey(sub_key)
-            except OSError: break
+            except OSError:
+                break
         winreg.CloseKey(reg_key)
-    except FileNotFoundError: pass
+    except FileNotFoundError:
+        pass
     return entries
 
 def collect_startup_folders():
@@ -294,12 +312,18 @@ def collect_scheduled_tasks_full():
 def collect_wmi_tasks():
     try:
         return [{'Имя': i.Name, 'Команда': i.Command, 'Пользователь': i.User} for i in wmi.WMI().Win32_StartupCommand()]
-    except Exception: return []
+    except Exception as e:
+        # Теперь мы не молчим, а сообщаем о проблеме
+        print(Fore.RED + f"[!] Не удалось получить WMI-задачи: {e}")
+        return []
 
 def collect_services():
     try:
         return [{'Имя': x.Name, 'Отображаемое имя': x.DisplayName, 'Путь': x.PathName} for x in wmi.WMI().Win32_Service() if x.StartMode == "Auto"]
-    except Exception: return []
+    except Exception as e:
+        # И здесь тоже сообщаем
+        print(Fore.RED + f"[!] Не удалось получить список служб: {e}")
+        return []
 
 def collect_network_connections():
     connections = []
@@ -314,7 +338,8 @@ def collect_network_connections():
                         'Удаленный адрес': f"{conn.raddr.ip}:{conn.raddr.port}",
                         'Статус': conn.status
                     })
-        except (psutil.NoSuchProcess, psutil.AccessDenied): continue
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
     return connections
 
 # ========================= Интерфейс ===============================
@@ -325,10 +350,11 @@ class ThreatHunterGUI:
         self.root.geometry("1400x800")
         self.settings = self.load_settings()
         self.yara_rules = compile_yara_rules()
+        self.data_queue = queue.Queue()
 
         menubar = tk.Menu(self.root)
         filemenu = tk.Menu(menubar, tearoff=0)
-        filemenu.add_command(label="Обновить всё", command=self.refresh_all)
+        filemenu.add_command(label="Обновить всё", command=self.start_refresh)
         filemenu.add_separator()
         filemenu.add_command(label="Выход", command=self.root.quit)
         menubar.add_cascade(label="Файл", menu=filemenu)
@@ -357,7 +383,7 @@ class ThreatHunterGUI:
         self.notebook.add(self.serv_frame, text="Службы Windows")
         self.notebook.add(self.sett_frame, text="Настройки")
 
-        self.refresh_btn = ttk.Button(self.root, text="🔄 Обновить всё", command=self.refresh_all)
+        self.refresh_btn = ttk.Button(self.root, text="🔄 Обновить всё", command=self.start_refresh)
         self.refresh_btn.pack(pady=5)
         
         ttk.Label(self.sett_frame, text="VirusTotal API Key:").pack(anchor='w', padx=10, pady=5)
@@ -384,11 +410,9 @@ class ThreatHunterGUI:
         
         self.net_context_menu = tk.Menu(self.root, tearoff=0)
         self.net_context_menu.add_command(label="Проверить IP на AbuseIPDB", command=self.check_selected_ip)
-        self.net_table.tablecolheader.bind("<Button-3>", self.show_net_menu)
-        self.net_table.rowheader.bind("<Button-3>", self.show_net_menu)
         self.net_table.bind("<Button-3>", self.show_net_menu)
 
-        self.refresh_all()
+        self.start_refresh()
 
     def create_table(self, parent):
         frame = ttk.Frame(parent)
@@ -397,20 +421,42 @@ class ThreatHunterGUI:
         pt.show()
         return pt
 
-    def refresh_all(self):
-        self.root.config(cursor="wait")
-        self.root.update_idletasks()
-        
-        self.update_table(self.proc_table, scan_suspicious_processes(self.yara_rules))
-        self.update_table(self.net_table, collect_network_connections())
-        self.update_table(self.auto_table, collect_autoruns_registry())
-        self.update_table(self.ifeo_table, collect_ifeo_hijacks())
-        self.update_table(self.start_table, collect_startup_folders())
-        self.update_table(self.sched_table, collect_scheduled_tasks_full())
-        self.update_table(self.wmi_table, collect_wmi_tasks())
-        self.update_table(self.serv_table, collect_services())
-        
-        self.root.config(cursor="")
+    def start_refresh(self):
+        self.refresh_btn.config(state="disabled", text="🔄 Идет сканирование...")
+        scan_thread = threading.Thread(target=self.run_scan_and_update_queue, daemon=True)
+        scan_thread.start()
+        self.process_queue()
+
+    def run_scan_and_update_queue(self):
+        self.data_queue.put(('proc', scan_suspicious_processes(self.yara_rules)))
+        self.data_queue.put(('net', collect_network_connections()))
+        self.data_queue.put(('auto', collect_autoruns_registry()))
+        self.data_queue.put(('ifeo', collect_ifeo_hijacks()))
+        self.data_queue.put(('start', collect_startup_folders()))
+        self.data_queue.put(('sched', collect_scheduled_tasks_full()))
+        self.data_queue.put(('wmi', collect_wmi_tasks()))
+        self.data_queue.put(('serv', collect_services()))
+        self.data_queue.put(('finished', None))
+
+    def process_queue(self):
+        try:
+            key, data = self.data_queue.get_nowait()
+            
+            if key == 'proc': self.update_table(self.proc_table, data)
+            elif key == 'net': self.update_table(self.net_table, data)
+            elif key == 'auto': self.update_table(self.auto_table, data)
+            elif key == 'ifeo': self.update_table(self.ifeo_table, data)
+            elif key == 'start': self.update_table(self.start_table, data)
+            elif key == 'sched': self.update_table(self.sched_table, data)
+            elif key == 'wmi': self.update_table(self.wmi_table, data)
+            elif key == 'serv': self.update_table(self.serv_table, data)
+            elif key == 'finished':
+                self.refresh_btn.config(state="normal", text="🔄 Обновить всё")
+                return
+            
+            self.root.after(100, self.process_queue)
+        except queue.Empty:
+            self.root.after(100, self.process_queue)
 
     def update_table(self, table_widget, data):
         df = pd.DataFrame(data)
@@ -438,7 +484,8 @@ class ThreatHunterGUI:
                     VIRUSTOTAL_API_KEY = s.get('virustotal_api_key', '')
                     ABUSEIPDB_API_KEY = s.get('abuseipdb_api_key', '')
                     return s
-            except Exception: pass
+            except Exception:
+                pass
         return {}
 
     def show_net_menu(self, event):
@@ -457,12 +504,10 @@ if __name__ == '__main__':
     if not PYWIN32_AVAILABLE:
         messagebox.showerror("Ошибка", "Библиотека pywin32 не найдена.\nПожалуйста, установите ее: pip install pywin32")
         exit()
-
     import ctypes
     if not ctypes.windll.shell32.IsUserAnAdmin():
         messagebox.showerror("Ошибка", "Программа должна быть запущена от имени администратора!")
         exit()
-
     root = tk.Tk()
     app = ThreatHunterGUI(root)
     root.mainloop()
