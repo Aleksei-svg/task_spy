@@ -1,0 +1,8 @@
+psutil
+requests
+wmi
+pandas
+pandastable
+colorama
+yara-python
+pywin32
