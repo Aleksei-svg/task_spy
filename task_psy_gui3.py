@@ -166,7 +166,6 @@ def scan_suspicious_processes(yara_rules=None):
                 suspicion_score += 40
                 reasons.append(f"🕵 Имя '{name}' вне System32")
             
-            # === НОВАЯ ЛОГИКА ДОБАВЛЕНА ЗДЕСЬ ===
             if exe_path and any(exe_path.lower().endswith(ext) for ext in HIGH_CONFIDENCE_SUSPICIOUS_EXTENSIONS):
                 suspicion_score += 50
                 reasons.append("🚫 Опасное расширение файла")
