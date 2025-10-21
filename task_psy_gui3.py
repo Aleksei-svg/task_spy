@@ -40,12 +40,10 @@ TARGET_EXTENSIONS = [
     '.b64', '.enc', '.dat', '.bin', '.cache'
 ]
 
-# === ОБА СПИСКА НА МЕСТЕ ===
 # Список для анализа команд в автозагрузке (реестр, планировщик и т.д.)
 DANGEROUS_COMMAND_EXTENSIONS = ['.cpl', '.msi', '.chm', '.hta', '.vbe', '.jse', '.scr']
 # Список для анализа уже запущенных процессов
 HIGH_CONFIDENCE_SUSPICIOUS_EXTENSIONS = ['.pif', '.scr', '.com', '.vbe', '.jse']
-
 
 # ========================= YARA ===============================
 try:
