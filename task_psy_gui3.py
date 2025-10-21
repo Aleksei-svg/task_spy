@@ -13,6 +13,7 @@ import pandas as pd
 from colorama import Fore, init
 import threading
 import queue
+import pythoncom
 
 try:
     import win32api
@@ -310,18 +311,18 @@ def collect_scheduled_tasks_full():
     return tasks
 
 def collect_wmi_tasks():
+    pythoncom.CoInitializeEx(0)
     try:
         return [{'Имя': i.Name, 'Команда': i.Command, 'Пользователь': i.User} for i in wmi.WMI().Win32_StartupCommand()]
     except Exception as e:
-        # Теперь мы не молчим, а сообщаем о проблеме
         print(Fore.RED + f"[!] Не удалось получить WMI-задачи: {e}")
         return []
 
 def collect_services():
+    pythoncom.CoInitializeEx(0)
     try:
         return [{'Имя': x.Name, 'Отображаемое имя': x.DisplayName, 'Путь': x.PathName} for x in wmi.WMI().Win32_Service() if x.StartMode == "Auto"]
     except Exception as e:
-        # И здесь тоже сообщаем
         print(Fore.RED + f"[!] Не удалось получить список служб: {e}")
         return []
 
@@ -329,7 +330,7 @@ def collect_network_connections():
     connections = []
     for proc in psutil.process_iter(['pid', 'name']):
         try:
-            conns = proc.connections(kind='inet')
+            conns = proc.net_connections(kind='inet')
             for conn in conns:
                 if conn.status == psutil.CONN_ESTABLISHED and conn.raddr:
                     connections.append({
